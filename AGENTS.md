@@ -21,7 +21,7 @@ mvn clean install -Dgoal=install
 
 Output: `target/*.lex`
 
-Maintainers deploy with a local `maven-deploy.sh` (not committed), which needs `MAVEN_USERNAME`, `MAVEN_PASSWORD` and `GPG_PASSPHRASE` in the environment. Never commit credentials.
+Versions are not edited by hand: `pom.xml` has `${revision}` (`extension.version.base` + build number + `extension.version.qualifier`), every push to the default branch gets the next build number and is published by the workflow (Maven Central, GitHub release, tag), a manual run can publish another qualifier, see the README. Never commit credentials.
 
 ## Test
 

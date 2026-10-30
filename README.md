@@ -30,4 +30,15 @@ The "lite" extension (`*.lite.lex`) has no `maven/` folder, Lucee loads the bund
 
 Differences to Lucee 8: Apache HttpClient 5 sends no `Content-Transfer-Encoding` header for the parts of a multipart request (RFC 7578 says to omit it), and some error messages differ.
 
+### Versioning and releases
+
+Like Lucee core (LDEV-6516) and the other extensions every code change gets its own version number, the version is not edited by hand ([LDEV-6810](https://luceeserver.atlassian.net/browse/LDEV-6810)).
+`pom.xml` uses a CI-friendly `${revision}` built from `extension.version.base` (`1.0.0`), a build number and `extension.version.qualifier` (`-BETA`).
+
+* **Every push to the default branch** (a merged PR or a direct commit) takes the highest existing build of the base, from the git tags, Maven Central and the Central snapshot repository, adds 1, builds, tests, publishes that version (e.g. `1.0.0.1-BETA`) to Maven Central and as a GitHub pre-release with the `.lex` files, and creates the tag `1.0.0.1`. No `[release]` keyword and no "set version" commit is needed.
+* Pushes run one after another (workflow concurrency queue), so two quick merges get two different numbers.
+* PR builds, other branches, forks and runs without the deploy secrets build and test `1.0.0.0-BETA` and never use up a number.
+* **Another kind of build** gets the next number as well: change `extension.version.qualifier` in `pom.xml` (`-RC`, empty for a final release), or run the workflow by hand (Actions > Run workflow), tick `deploy` and pick `SNAPSHOT`, `ALPHA`, `BETA`, `RC` or `release` as qualifier. A manual run publishes the current code once, without a commit, the pom keeps its qualifier.
+* To start a new line change `extension.version.base`.
+
 Issues: https://luceeserver.atlassian.net/browse/LDEV-6677
