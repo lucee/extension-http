@@ -1,5 +1,6 @@
 package org.lucee.extension.http;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -20,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.SSLContext;
@@ -46,11 +48,16 @@ import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.impl.auth.BasicScheme;
 import org.apache.hc.client5.http.impl.auth.BasicSchemeFactory;
 import org.apache.hc.client5.http.impl.auth.DigestSchemeFactory;
+import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
+import org.apache.hc.client5.http.impl.async.HttpAsyncClientBuilder;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
 import org.apache.hc.client5.http.impl.cookie.BasicClientCookie;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManager;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.config.TlsConfig;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.ssl.DefaultClientTlsStrategy;
 import org.apache.hc.client5.http.ssl.HostnameVerificationPolicy;
@@ -68,6 +75,9 @@ import org.apache.hc.core5.http.NoHttpResponseException;
 import org.apache.hc.core5.http.config.Lookup;
 import org.apache.hc.core5.http.config.RegistryBuilder;
 import org.apache.hc.core5.http.io.SocketConfig;
+import org.apache.hc.core5.http2.HttpVersionPolicy;
+import org.apache.hc.core5.http2.config.H2Config;
+import org.apache.hc.core5.reactor.IOReactorConfig;
 import org.apache.hc.core5.http.io.entity.AbstractHttpEntity;
 import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
@@ -111,8 +121,11 @@ public final class HC5Engine implements HTTPClientEngine {
 	// like the built-in engine
 	private static final int MAX_REDIRECTS = 50;
 
+	// HTTPClientEngine.FEATURE_HTTP2 of the core that knows the attribute httpVersion, the extension also builds against an older core
+	private static final String FEATURE_HTTP2 = "http2";
+
 	private static final List<String> FEATURES = Collections.unmodifiableList(Arrays.asList(FEATURE_NTLM, FEATURE_PREEMPTIVE_AUTH, FEATURE_RESTRICTED_HEADERS,
-			FEATURE_TLS_OPTIONS, FEATURE_POOL));
+			FEATURE_TLS_OPTIONS, FEATURE_POOL, FEATURE_HTTP2));
 
 	private static final List<String> SCHEMES_NTLM = Collections.singletonList(StandardAuthScheme.NTLM);
 	private static final List<String> SCHEMES_DEFAULT = Collections.unmodifiableList(Arrays.asList(StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC));
@@ -124,15 +137,57 @@ public final class HC5Engine implements HTTPClientEngine {
 
 	/**
 	 * a connection pool and the client that uses it, the client has no state of a request (cookies,
-	 * credentials, proxy, redirects and time-outs are set per request)
+	 * credentials, proxy, redirects and time-outs are set per request). A pool is either a pool of the
+	 * classic client (HTTP/1.1) or of the asynchronous client (HTTP/2 and HTTP/1.1, LDEV-6470).
 	 */
 	private static final class Pool {
+		// the classic client
 		final PoolingHttpClientConnectionManager manager;
 		final CloseableHttpClient client;
+		// the asynchronous client
+		final PoolingAsyncClientConnectionManager asyncManager;
+		final CloseableHttpAsyncClient asyncClient;
 
 		Pool(PoolingHttpClientConnectionManager manager, CloseableHttpClient client) {
 			this.manager = manager;
 			this.client = client;
+			this.asyncManager = null;
+			this.asyncClient = null;
+		}
+
+		Pool(PoolingAsyncClientConnectionManager manager, CloseableHttpAsyncClient client) {
+			this.manager = null;
+			this.client = null;
+			this.asyncManager = manager;
+			this.asyncClient = client;
+		}
+
+		void closeExpired() {
+			if (manager != null) manager.closeExpired();
+			else asyncManager.closeExpired();
+		}
+
+		void closeIdle(TimeValue idle) {
+			if (manager != null) manager.closeIdle(idle);
+			else asyncManager.closeIdle(idle);
+		}
+
+		PoolStats getTotalStats() {
+			return manager != null ? manager.getTotalStats() : asyncManager.getTotalStats();
+		}
+
+		PoolStats getStats(HttpRoute route) {
+			return manager != null ? manager.getStats(route) : asyncManager.getStats(route);
+		}
+
+		Set<HttpRoute> getRoutes() {
+			return manager != null ? manager.getRoutes() : asyncManager.getRoutes();
+		}
+
+		// closes the connections and the client, for the asynchronous client also its threads
+		void close(CloseMode mode) {
+			if (manager != null) manager.close(mode);
+			else asyncClient.close(mode);
 		}
 	}
 
@@ -162,12 +217,12 @@ public final class HC5Engine implements HTTPClientEngine {
 	// pool and client
 	// ------------------------------------------------------------------------------------------
 
-	private Pool pool(HTTPRequest r) throws IOException {
-		String key = poolKey(r);
+	private Pool pool(HTTPRequest r, HttpVersionPolicy policy) throws IOException {
+		String key = poolKey(r, policy);
 		synchronized (lock) {
 			Pool p = pools.get(key);
 			if (p != null) return p;
-			p = createPool(r, POOL_MAX_CONN, POOL_MAX_CONN_PER_ROUTE);
+			p = createPool(r, policy, POOL_MAX_CONN, POOL_MAX_CONN_PER_ROUTE);
 			pools.put(key, p);
 			if (pools.size() > MAX_POOLS) {
 				Iterator<Pool> it = pools.values().iterator();
@@ -179,8 +234,10 @@ public final class HC5Engine implements HTTPClientEngine {
 		}
 	}
 
-	private static String poolKey(HTTPRequest r) throws IOException {
+	private static String poolKey(HTTPRequest r, HttpVersionPolicy policy) throws IOException {
 		StringBuilder sb = new StringBuilder();
+		// the classic client (null) and the asynchronous client with each policy have a pool of their own
+		append(sb, policy == null ? null : policy.name());
 		append(sb, r.getClientCert());
 		append(sb, r.getClientCertPassword());
 		append(sb, r.getTrustStore());
@@ -206,7 +263,7 @@ public final class HC5Engine implements HTTPClientEngine {
 		sb.append('|');
 	}
 
-	private static Pool createPool(HTTPRequest r, int maxTotal, int maxPerRoute) throws IOException {
+	private static Pool createPool(HTTPRequest r, HttpVersionPolicy policy, int maxTotal, int maxPerRoute) throws IOException {
 		// the same SSL context as the built-in engine: the trust store of the JVM, the custom cacerts of Lucee
 		// (SSLCertificateInstall) and the trustStore of the request, or no verification at all
 		SSLContext ctx;
@@ -219,6 +276,8 @@ public final class HC5Engine implements HTTPClientEngine {
 		// with the built-in policy the JDK verifies the host name and a verifier is not asked, so for no verification the verifier decides
 		DefaultClientTlsStrategy tls = r.isSslVerify() ? new DefaultClientTlsStrategy(ctx)
 				: new DefaultClientTlsStrategy(ctx, HostnameVerificationPolicy.CLIENT, NoopHostnameVerifier.INSTANCE);
+
+		if (policy != null) return createAsyncPool(tls, policy, maxTotal, maxPerRoute);
 
 		PoolingHttpClientConnectionManager cm = PoolingHttpClientConnectionManagerBuilder.create().setTlsSocketStrategy(tls).setMaxConnTotal(maxTotal)
 				.setMaxConnPerRoute(maxPerRoute).setDefaultSocketConfig(SocketConfig.custom().setTcpNoDelay(true).setSoReuseAddress(true).build())
@@ -234,6 +293,27 @@ public final class HC5Engine implements HTTPClientEngine {
 	}
 
 	/**
+	 * the pool of the asynchronous client, it speaks HTTP/2: the policy FORCE_HTTP_2 only (ALPN offers only "h2" with TLS, a
+	 * server that does not speak HTTP/2 makes the request fail, without TLS the client expects HTTP/2 without an upgrade, "prior
+	 * knowledge") and NEGOTIATE HTTP/2 or HTTP/1.1, what the server selects with ALPN (without TLS it is HTTP/1.1)
+	 */
+	private static Pool createAsyncPool(DefaultClientTlsStrategy tls, HttpVersionPolicy policy, int maxTotal, int maxPerRoute) {
+		PoolingAsyncClientConnectionManager cm = PoolingAsyncClientConnectionManagerBuilder.create().setTlsStrategy(tls).setMaxConnTotal(maxTotal)
+				.setMaxConnPerRoute(maxPerRoute).setDefaultTlsConfig(TlsConfig.custom().setVersionPolicy(policy).build())
+				.setDefaultConnectionConfig(ConnectionConfig.custom().setTimeToLive(TimeValue.ofMilliseconds(POOL_CONN_TTL_MS))
+						.setValidateAfterInactivity(TimeValue.ofMilliseconds(POOL_CONN_INACTIVITY_MS)).build())
+				.build();
+
+		// the pushes of the server are refused, cfhttp has nowhere to put them. The threads that do the IO are few, a request
+		// waits for its response.
+		CloseableHttpAsyncClient client = HttpAsyncClientBuilder.create().setConnectionManager(cm).setVersionPolicy(policy).setH2Config(H2Config.custom().setPushEnabled(false).build())
+				.setIOReactorConfig(IOReactorConfig.custom().setIoThreadCount(2).setSoReuseAddress(true).setTcpNoDelay(true).build()).disableRedirectHandling()
+				.setRetryStrategy(new RetryStrategy()).setDefaultAuthSchemeRegistry(AUTH_SCHEMES).build();
+		client.start();
+		return new Pool(cm, client);
+	}
+
+	/**
 	 * closes the retired pools that have no leased connection anymore, the other ones only close their
 	 * idle connections, must be called with the lock
 	 */
@@ -241,10 +321,10 @@ public final class HC5Engine implements HTTPClientEngine {
 		Iterator<Pool> it = retired.iterator();
 		while (it.hasNext()) {
 			Pool p = it.next();
-			p.manager.closeIdle(TimeValue.ZERO_MILLISECONDS);
-			PoolStats stats = p.manager.getTotalStats();
+			p.closeIdle(TimeValue.ZERO_MILLISECONDS);
+			PoolStats stats = p.getTotalStats();
 			if (stats.getLeased() == 0 && stats.getPending() == 0) {
-				p.manager.close(CloseMode.GRACEFUL);
+				p.close(CloseMode.GRACEFUL);
 				it.remove();
 			}
 		}
@@ -349,39 +429,54 @@ public final class HC5Engine implements HTTPClientEngine {
 
 		// a pooled request uses the client of its pool, a request without pooling gets a client and a
 		// connection of its own, they are closed with the response
-		CloseableHttpClient client;
-		CloseableHttpClient ownClient = null;
+		// httpVersion "2" and "auto" use the asynchronous client (LDEV-6470), the default is the classic client
+		HttpVersionPolicy policy = versionPolicy(r, ntlm);
+		CloseableHttpClient client = null;
+		CloseableHttpAsyncClient asyncClient = null;
+		Closeable ownClient = null;
 		Pool pool = null;
 		if (r.isPooling()) {
-			client = (pool = pool(r)).client;
+			pool = pool(r, policy);
+			client = pool.client;
+			asyncClient = pool.asyncClient;
 		}
 		else {
-			client = ownClient = createPool(r, 1, 1).client;
+			Pool own = createPool(r, policy, 1, 1);
+			client = own.client;
+			asyncClient = own.asyncClient;
+			ownClient = client != null ? client : asyncClient;
 		}
 
 		String method = r.getMethod();
 		HttpEntity entity = createEntity(r, method);
 		List<URI> locations = new ArrayList<>();
-		AtomicReference<HttpUriRequestBase> current = new AtomicReference<>();
+		AtomicReference<Runnable> canceller = new AtomicReference<>();
 		// the connections this call has seen (local address + remote address), and if they were already used by an
 		// earlier call (LDEV-2675)
 		Map<String, Boolean> connections = new HashMap<>();
 		Boolean reused = null;
 		r.setAbortHandler(() -> {
-			HttpUriRequestBase req = current.get();
-			if (req != null) req.cancel();
+			Runnable cancel = canceller.get();
+			if (cancel != null) cancel.run();
 		});
 
 		try {
+			// the asynchronous client sends a body that is in memory
+			if (asyncClient != null) entity = HC5Async.buffer(entity);
+
 			int redirects = 0;
 			while (true) {
-				HttpUriRequestBase req = createRequest(r, method, uri, entity);
-				current.set(req);
-				if (r.isAborted()) req.cancel();
-
 				ClassicHttpResponse rsp;
 				try {
-					rsp = client.executeOpen(null, req, context);
+					if (asyncClient != null) {
+						rsp = HC5Async.execute(asyncClient, method, uri, r, entity, context, canceller);
+					}
+					else {
+						HttpUriRequestBase req = createRequest(r, method, uri, entity);
+						canceller.set(req::cancel);
+						if (r.isAborted()) req.cancel();
+						rsp = client.executeOpen(null, req, context);
+					}
 				}
 				catch (org.apache.hc.client5.http.ConnectTimeoutException e) {
 					// a connect time-out is a connection failure, not a time-out of the request (408), like with the
@@ -436,6 +531,52 @@ public final class HC5Engine implements HTTPClientEngine {
 	}
 
 	/**
+	 * the version of the protocol the request asks for (LDEV-6470)
+	 * 
+	 * @return null for the classic client (HTTP/1.1, the default), FORCE_HTTP_2 for httpVersion="2" and NEGOTIATE for "auto"
+	 */
+	private static HttpVersionPolicy versionPolicy(HTTPRequest r, boolean ntlm) throws IOException {
+		String version = httpVersion(r);
+		if (version == null || "1.1".equals(version)) return null;
+		if ("2".equals(version)) {
+			// NTLM authenticates the connection, HTTP/2 shares the connection between requests
+			if (ntlm) throw new IOException("NTLM authentication does not work with HTTP/2 (httpVersion=\"2\"), it authenticates a connection and HTTP/2 shares a connection");
+			return HttpVersionPolicy.FORCE_HTTP_2;
+		}
+		if ("auto".equals(version)) return ntlm ? null : HttpVersionPolicy.NEGOTIATE;
+		throw new IOException("invalid value for httpVersion [" + version + "], valid values are: 1.1, 2, auto");
+	}
+
+	private static volatile java.lang.reflect.Method getHttpVersion;
+	private static volatile boolean getHttpVersionLooked;
+
+	/**
+	 * the attribute httpVersion of the request, the core before the attribute does not know it (that is HTTP/1.1)
+	 */
+	private static String httpVersion(HTTPRequest r) throws IOException {
+		if (!getHttpVersionLooked) {
+			try {
+				getHttpVersion = HTTPRequest.class.getMethod("getHttpVersion");
+			}
+			catch (NoSuchMethodException e) {
+				getHttpVersion = null;
+			}
+			getHttpVersionLooked = true;
+		}
+		if (getHttpVersion == null) return null;
+		try {
+			Object v = getHttpVersion.invoke(r);
+			return v == null ? null : v.toString().trim().toLowerCase(Locale.ROOT);
+		}
+		catch (java.lang.reflect.InvocationTargetException e) {
+			throw Util.engine().getExceptionUtil().toIOException(e.getCause() == null ? e : e.getCause());
+		}
+		catch (IllegalAccessException e) {
+			throw Util.engine().getExceptionUtil().toIOException(e);
+		}
+	}
+
+	/**
 	 * Was the connection that carried the last exchange already used by an earlier call (LDEV-2675)?
 	 * 
 	 * The number of requests the connection has carried is the reliable source: a new connection has carried exactly
@@ -471,7 +612,7 @@ public final class HC5Engine implements HTTPClientEngine {
 		RouteInfo route = context.getHttpRoute();
 		if (route != null) sct.setEL("route", route.getTargetHost().toHostString());
 		if (pool != null && route instanceof HttpRoute) {
-			PoolStats stats = pool.manager.getStats((HttpRoute) route);
+			PoolStats stats = pool.getStats((HttpRoute) route);
 			sct.setEL("leased", stats.getLeased());
 			sct.setEL("available", stats.getAvailable());
 			sct.setEL("pending", stats.getPending());
@@ -759,8 +900,8 @@ public final class HC5Engine implements HTTPClientEngine {
 	public void closeIdleConnections() {
 		synchronized (lock) {
 			for (Pool p: pools.values()) {
-				p.manager.closeExpired();
-				p.manager.closeIdle(TimeValue.ofMilliseconds(POOL_CONN_TTL_MS));
+				p.closeExpired();
+				p.closeIdle(TimeValue.ofMilliseconds(POOL_CONN_TTL_MS));
 			}
 			closeRetired();
 		}
@@ -772,7 +913,7 @@ public final class HC5Engine implements HTTPClientEngine {
 			retired.addAll(pools.values());
 			pools.clear();
 			for (Pool p: retired) {
-				p.manager.close(CloseMode.GRACEFUL);
+				p.close(CloseMode.GRACEFUL);
 			}
 			retired.clear();
 		}
@@ -799,19 +940,15 @@ public final class HC5Engine implements HTTPClientEngine {
 
 	@Override
 	public Struct getPoolStats() {
-		List<PoolingHttpClientConnectionManager> managers = new ArrayList<>();
+		List<Pool> managers = new ArrayList<>();
 		synchronized (lock) {
-			for (Pool p: pools.values()) {
-				managers.add(p.manager);
-			}
-			for (Pool p: retired) {
-				managers.add(p.manager);
-			}
+			managers.addAll(pools.values());
+			managers.addAll(retired);
 		}
 		Struct sct = Util.engine().getCreationUtil().createStruct();
 		Struct routes = Util.engine().getCreationUtil().createStruct();
 		int leased = 0, available = 0, pending = 0, max = 0;
-		for (PoolingHttpClientConnectionManager cm: managers) {
+		for (Pool cm: managers) {
 			PoolStats totals = cm.getTotalStats();
 			leased += totals.getLeased();
 			available += totals.getAvailable();

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.0.2-BETA
+
+- [LDEV-6470](https://luceeserver.atlassian.net/browse/LDEV-6470) — HTTP/2 for `cfhttp`, opt in with the attribute `httpVersion` (`"1.1"` default, `"2"`, `"auto"`). `"2"` uses HTTP/2 only (TLS with ALPN, or h2c with prior knowledge over plain http) and is an error when the server can not speak it, there is no fallback; `"auto"` uses HTTP/2 when the server offers it with ALPN and HTTP/1.1 otherwise. The protocol that was used is in the key `http_version` of the result. The requests of `"2"` and `"auto"` run on the asynchronous client of HttpClient 5 (the bodies are buffered in memory, server push is refused), the default `"1.1"` is unchanged. It needs a Lucee version that has the attribute `httpVersion` (LDEV-6470), with an older Lucee the extension still works, but `cfhttp` does not know the attribute. Tests in `tests/HttpHttp2Test.cfc` use a HTTP/2 server written in CFML (`tests/_H2Server.cfc`), so they need no public server
+
 ## 1.0.0.1-BETA
 
 - [LDEV-2822](https://luceeserver.atlassian.net/browse/LDEV-2822) — with debugging enabled every HTTP call has an entry in the section "HTTP" of the debugging output: method, host and path (never the query string or the user info), status code, duration and whether the pooled connection was reused. The entries are added with the generic data of the debugger of Lucee (the same as `DebugAdd()`), there is no entry without debugging. Tests in `tests/HttpDebugTest.cfc`
