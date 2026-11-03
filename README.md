@@ -8,6 +8,7 @@ Install it when you need what the built-in engine can not do:
 * Digest authentication (the scheme the server asks for, Digest before Basic)
 * Basic authentication at a proxy for a HTTPS request (the credentials are sent with the `CONNECT` of the tunnel)
 * setting the headers the JDK does not allow to set (`Host`, `Connection`, `Expect`, `Upgrade`)
+* HTTP/2 (`httpVersion="2"` or `"auto"`, see below)
 * the connection pool and its statistics (`getSystemInfo()`)
 * separate connect and socket timeouts, retry of an idempotent request (GET, HEAD, ...) when a pooled connection was closed by the server, a POST is never retried
 
@@ -25,6 +26,23 @@ Behaviour:
 * When a proxy refuses the tunnel for a HTTPS request, the response of the proxy is the result (as with HttpClient 4).
 * NTLM uses the NTLM implementation of HttpClient 5, which HttpClient 5 marks as deprecated, and HttpClient 5.6 ignores the `workstation`.
 * Each combination of client certificate and trust store gets its own connection pool (at most 64, the least recently used is closed when its connections are idle), the trust store is the same as for the built-in engine.
+
+### HTTP/2
+
+`cfhttp` has the attribute `httpVersion` ([LDEV-6470](https://luceeserver.atlassian.net/browse/LDEV-6470), it needs a Lucee version that has the attribute). HTTP/2 is opt in, the default is HTTP/1.1 as before.
+
+| `httpVersion` | Behaviour |
+| --- | --- |
+| `"1.1"` (default) | HTTP/1.1, the same code path as before |
+| `"2"` | HTTP/2 only. Over `https` the protocol is negotiated with ALPN and only `h2` is offered, over `http` the client starts HTTP/2 directly ("prior knowledge", h2c, no `Upgrade`). When the server can not speak HTTP/2 the request is an error, **there is no fallback to HTTP/1.1** and nothing is sent with HTTP/1.1 |
+| `"auto"` | Over `https` the client offers `h2` and `http/1.1` with ALPN and uses what the server picks, so a server without HTTP/2 gets HTTP/1.1. Over `http` it uses HTTP/1.1 (no h2c without prior knowledge) |
+
+* Any other value is an error, also with `throwOnError=false`.
+* The protocol that was used is in the key `http_version` of the result (`HTTP/2.0` or `HTTP/1.1`). HTTP/2 has no reason phrase, `status_text` comes from the standard text of the status code.
+* An error with `httpVersion="2"` is reported like every other connection failure: with `throwOnError=true` an exception is thrown, otherwise the result has `error=true`, `status_code=0` and the cause in `errordetail`. It is never turned into a response.
+* The requests of `"2"` and `"auto"` run on the asynchronous client of HttpClient 5, with one pool per combination of client certificate, trust store and protocol policy. The request and the response body are buffered in memory (as with HTTP/1.1 the result holds the whole body anyway), a response with a `Content-Encoding` is decoded, server push is refused. Redirects, cookies, Basic authentication, headers and form and multipart bodies work as with HTTP/1.1.
+* NTLM needs HTTP/1.1: `httpVersion="2"` with `authType="NTLM"` is an error, `"auto"` with NTLM uses HTTP/1.1.
+* With the built-in engine of Lucee (no extension) `"2"` is an error that names this extension, and `"auto"` uses HTTP/1.1.
 
 The "lite" extension (`*.lite.lex`) has no `maven/` folder, Lucee loads the bundled libraries from Maven, the same as for the other Lucee extensions.
 

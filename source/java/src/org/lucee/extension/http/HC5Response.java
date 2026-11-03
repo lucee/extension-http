@@ -1,6 +1,7 @@
 package org.lucee.extension.http;
 
 import java.io.ByteArrayInputStream;
+import java.io.Closeable;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -10,7 +11,6 @@ import java.net.URL;
 import java.nio.charset.Charset;
 import java.util.List;
 
-import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.HttpEntity;
 
@@ -71,7 +71,7 @@ final class HC5Response implements HTTPResponse {
 	}
 
 	private final ClassicHttpResponse rsp;
-	private final CloseableHttpClient client;
+	private final Closeable client;
 	private final URL url;
 	private final URL target;
 	private final List<URI> locations;
@@ -88,7 +88,7 @@ final class HC5Response implements HTTPResponse {
 	 * @param locations the URLs of the redirects that were followed
 	 * @param connection the data about the connection of the response, for the result of the tag (LDEV-2675)
 	 */
-	HC5Response(ClassicHttpResponse rsp, CloseableHttpClient client, URL url, URI target, List<URI> locations, Struct connection) throws MalformedURLException {
+	HC5Response(ClassicHttpResponse rsp, Closeable client, URL url, URI target, List<URI> locations, Struct connection) throws MalformedURLException {
 		this.rsp = rsp;
 		this.client = client;
 		this.url = url;

@@ -4,11 +4,11 @@ Maven-based Lucee extension with the HTTP engine based on Apache HttpClient 5. I
 
 ## Folder Structure
 
-- `source/java/src/` — Java source (`org.lucee.extension.http.HC5Engine` the engine, `HC5Response` the response, `Util` the access to the loader API)
+- `source/java/src/` — Java source (`org.lucee.extension.http.HC5Engine` the engine, `HC5Async` the HTTP/2 and "auto" exchange on the async client, `HC5Response` the response, `Util` the access to the loader API)
 - `source/java/pom.xml` — module POM (dependencies httpclient5, httpcore5, httpcore5-h2 and slf4j-api, bundled into the extension)
 - `pom.xml` — root Maven build, extension manifest values, `.lex` packaging
 - `build.xml` — Ant part of the build, writes the extension `MANIFEST.MF` (called from Maven)
-- `tests/` — CFML integration tests (label: `http`), `_RecordingServer.cfc` is a helper (files starting with `_` are not run as tests)
+- `tests/` — CFML integration tests (label: `http`), `_RecordingServer.cfc`, `_KeepAliveServer.cfc` and `_H2Server.cfc` (a HTTP/2 server in CFML with ALPN, h2c and an HTTP/1.1 mode, keystore in `_h2/`) are helpers (files starting with `_` are not run as tests)
 - `CHANGELOG.md` — release notes, update for user-visible changes
 
 ## Build
@@ -28,6 +28,8 @@ Versions are not edited by hand: `pom.xml` has `${revision}` (`extension.version
 CI (`.github/workflows/main.yml`) builds and runs, with the extension installed, the Lucee tests labelled `http` and `cfhttp,ssl` plus the tests in `tests/` with [script-runner](https://github.com/lucee/script-runner) and an httpbin service, against the Lucee versions in the variable `LUCEE_TEST_VERSIONS_9` (organization or repository). There is no fallback version, without the variable the build fails.
 
 ## Notes
+
+- `httpVersion` (LDEV-6470): the extension reads it reflectively from the request (`getHttpVersion`), because it compiles against an older Lucee jar. `"1.1"` stays on the classic client, `"2"` and `"auto"` use the async client; `"2"` must never fall back to HTTP/1.1 and errors must never be swallowed. The tests of `HttpHttp2Test.cfc` need a Lucee build that has the attribute (`LUCEE_TEST_VERSIONS_9`).
 
 - The extension only uses the loader API (through `org.lucee.extension.http.Util`), never core classes.
 - Minimum Lucee version is in `luceeCoreVersion` in `pom.xml`, it must be a Lucee version that knows the `http-engine` manifest attribute.
