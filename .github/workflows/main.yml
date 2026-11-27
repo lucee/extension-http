@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
-        description: 'Publish (a new build number) to Maven Central and as GitHub release'
+        description: 'Publish a new build number. Finals go to Maven Central; ALPHA, BETA, RC and SNAPSHOT go to maven.lucee-services.com only'
         type: boolean
         default: false
       qualifier:
-        description: 'Qualifier for this run. "pom" keeps extension.version.qualifier from pom.xml; pick ALPHA, BETA, RC, SNAPSHOT or release (none) to publish that kind of build from the current code'
+        description: 'Qualifier for this run. "pom" keeps extension.version.qualifier from pom.xml. SNAPSHOT, ALPHA, BETA and RC are published to maven.lucee-services.com, never Maven Central. "release" (no qualifier) is the final and goes to Maven Central'
         type: choice
         options: [pom, SNAPSHOT, ALPHA, BETA, RC, release]
         default: pom
@@ -103,14 +103,17 @@ jobs:
 
           git fetch --tags --force origin 2>/dev/null || true
 
-          # highest build of this base, from git tags (base.N), Maven Central and the Central snapshot repository (base.N[-QUALIFIER]).
-          # Both are checked, so a version published without a plain tag (e.g. 1.0.0.0-BETA) is never built twice.
+          # highest build of this base, from git tags (base.N), Maven Central, the Central snapshot repository
+          # and maven.lucee-services.com (base.N[-QUALIFIER]). All are checked so a version published without a
+          # tag or only to the Lucee Maven repository is never built twice.
           BUILDS=$(git tag -l "${BASE}.*" | sed -nE "s/^${BASE_RE}\.([0-9]+)$/\1/p" || true)
           for url in \
             "https://repo1.maven.org/maven2/org/lucee/http-extension/maven-metadata.xml" \
             "https://repo1.maven.org/maven2/org/lucee/http/maven-metadata.xml" \
             "https://central.sonatype.com/repository/maven-snapshots/org/lucee/http-extension/maven-metadata.xml" \
-            "https://central.sonatype.com/repository/maven-snapshots/org/lucee/http/maven-metadata.xml"
+            "https://central.sonatype.com/repository/maven-snapshots/org/lucee/http/maven-metadata.xml" \
+            "https://maven.lucee-services.com/org/lucee/http-extension/maven-metadata.xml" \
+            "https://maven.lucee-services.com/org/lucee/http/maven-metadata.xml"
           do
             META=$(curl -fsSL --max-time 30 "$url" 2>/dev/null || true)
             BUILDS="$BUILDS"$'\n'$(printf '%s' "$META" | grep -oE "<version>${BASE_RE}\.[0-9]+([-.][^<]*)?</version>" | sed -E "s#<version>${BASE_RE}\.([0-9]+).*#\1#" || true)
@@ -310,22 +313,27 @@ jobs:
           if [ -z "$VERSION" ]; then
             echo "::error::no version from the setup job"; exit 1
           fi
-          # central-publishing-maven-plugin sends a -SNAPSHOT version to the Central snapshot repository
-          # (https://central.sonatype.com/repository/maven-snapshots/), any other qualifier (-ALPHA, -BETA, -RC or none) to Maven Central.
-          # Everything is signed, snapshots included.
-          if [[ "$VERSION" == *-SNAPSHOT ]]; then
-            echo "------- Maven Deploy snapshot $VERSION -------"
+          # Only a final release (no qualifier) is deployed to Maven Central.
+          # SNAPSHOT, ALPHA, BETA and RC are signed with mvn install and published to
+          # maven.lucee-services.com by the s3 job. Never Central.
+          if [[ "$VERSION" == *-SNAPSHOT ]] || [[ "$VERSION" =~ -(RC|BETA|ALPHA)$ ]]; then
+            echo "------- Maven Install (signed) $VERSION, Lucee Maven repository (maven.lucee-services.com), never Central -------"
+            mvn -B -e -f pom.xml clean install -Dgoal=install -DperformRelease=true -Drevision="$VERSION" --settings maven-settings.xml
           else
-            echo "------- Maven Deploy release $VERSION -------"
+            echo "------- Maven Deploy release $VERSION to Maven Central -------"
+            mvn -B -e -f pom.xml clean deploy -Dgoal=deploy -DperformRelease=true -Drevision="$VERSION" --settings maven-settings.xml
           fi
-          mvn -B -e -f pom.xml clean deploy -Dgoal=deploy -DperformRelease=true -Drevision="$VERSION" --settings maven-settings.xml
 
-      # LDEV-6677: the published .lex files (full and lite) for the github-release job
-      - name: Upload artifact for GitHub release
+      # everything the S3 upload and the GitHub release need: full and lite .lex plus the flattened POM
+      - name: Upload artifact for S3 and GitHub release
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: http-release
-          path: target/*.lex
+          name: http-s3
+          include-hidden-files: true
+          path: |
+            target/*.lex
+            .flattened-pom.xml
 
       - name: Tag published revision
         if: success() && needs.setup.outputs.tag != ''
@@ -347,7 +355,7 @@ jobs:
 
   # LDEV-6677: publish every final, ALPHA, BETA and RC build as a GitHub release with its .lex files attached,
   # like the other extensions (LDEV-6511). -SNAPSHOT builds get no GitHub release.
-  # Separate job, so a failure here never blocks the Maven Central deploy.
+  # Separate job, so a failure here never blocks the Maven Central or Lucee Maven repository upload.
   github-release:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -357,11 +365,11 @@ jobs:
       # create the release (and its tag) and upload its assets
       contents: write
     steps:
-      # the files the deploy job built and published
+      # the same files the S3 job uploads (built by the deploy job with the published version)
       - name: Download published extension
         uses: actions/download-artifact@v4
         with:
-          name: http-release
+          name: http-s3
           path: release-files
 
       - name: Create GitHub release
@@ -406,3 +414,18 @@ jobs:
               --title "$VERSION" \
               --notes "Build $VERSION from commit $GITHUB_SHA, published by $RUN_URL"
           fi
+
+  # Upload the published build in Maven layout (LDEV-6568) via the shared reusable workflow.
+  # Cut-off rules (SNAPSHOTs stop on 2027-03-01) live in the called workflow.
+  # Finals also go to Maven Central; SNAPSHOT, ALPHA, BETA and RC are only uploaded here
+  # (and as GitHub releases, except SNAPSHOT).
+  # secrets: inherit passes the org secrets S3_ACCESS_ID_DOWNLOAD and S3_SECRET_KEY_DOWNLOAD.
+  # The called workflow warns and skips when those secrets are not available to this repo.
+  s3:
+    needs: [setup, deploy]
+    if: needs.deploy.result == 'success' && needs.setup.outputs.deploy == 'true'
+    uses: lucee/lucee/.github/workflows/extension-s3-upload.yml@7.1
+    with:
+      artifact-name: http-s3
+      version: ${{ needs.setup.outputs.version }}
+    secrets: inherit
